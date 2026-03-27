@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <!-- Import bootstrap -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet"
+        integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
+
+    <title>My Web Page</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+
+<body class="container">
+    <header>
+        <h1>All alerts</h1>
+        <a href="/" class="btn btn-secondary">Back to Home</a><br><br>
+    </header>
+
+    <main>
+        <!-- For-loop to display alerts -->
+        {% for alert in alerts %}
+        {% if alert.cam_no.isdigit() %}
+        <h3>{{ alert.alert_type }} at {{ alert.timestamp }} (Camera {{ alert.cam_no|int + 1 }})</h3>
+        {% else %}
+        <h3>{{ alert.alert_type }} at {{ alert.timestamp }} (Camera {{ alert.cam_no }})</h3>
+        {% endif %}
+        <img src="data:image/png;base64,{{ alert.alert_image }}" width="50%"
+            alt="Alert image for {{ alert.alert_type }}">&nbsp;&nbsp;
+        <form method="post" action="/delete_alert/{{ alert.id }}">
+            <button type="submit" class="btn btn-danger">Delete Alert</button>
+        </form>
+        <hr>
+        {% endfor %}
+    </main>
+
+    <!-- Display evidence files -->
+    <section>
+        <h2>Alert Evidence Files</h2>
+        {% for path in alert_evidence_paths %}
+        <p><a href="{{ url_for('download_file', filepath=path) }}">{{ path[-17:-4] }}</a></p>
+        {% endfor %}
+    </section>
+
+    <!-- Route to download all alerts -->
+    {% if cam_no is none %}
+    <section>
+        <h2>Download All Alert Evidence</h2>
+        <a href="/download_all_alerts" class="btn btn-primary">Download all alert evidence</a>
+    </section>
+    {% endif %}
+
+    <!-- Route to delete all alerts -->
+    <section>
+        <h2>Delete All Alerts</h2>
+        {% if cam_no is not none %}
+        <form method="post" action="/clear_alerts/{{ cam_no }}">
+            <button type="submit" class="btn btn-danger">Clear All Alerts</button>
+        </form>
+        {% else %}
+        <form method="post" action="/clear_alerts">
+            <button type="submit" class="btn btn-danger">Clear All Alerts</button>
+        </form>
+        {% endif %}
+    </section>
+    <hr>
+    <footer>
+        <p>&copy; 2026 My Web Page</p>
+    </footer>
+</body>
+
+</html>
