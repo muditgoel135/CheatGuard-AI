@@ -1,6 +1,7 @@
 # Import necessary libraries
 import base64
-from flask import Flask, Response, render_template, send_file, send_from_directory
+import json
+from flask import Flask, Response, render_template, send_file, send_from_directory, redirect, request
 from flask_sqlalchemy import SQLAlchemy
 import cv2
 import datetime
@@ -50,25 +51,79 @@ with app.app_context():
     db.create_all()
 
 
-def find_cameras() -> int:
+def scan_local_cameras(max_index: int = 10) -> list:
     """
-    Finds the number of connected cameras.
-    It attempts to open video capture for sequential indices until it fails, counting the number of successful opens.
-    As soon as it encounters an index that cannot be opened, it assumes there are no more cameras and returns the count.
+    Scans for locally connected cameras across a range of indices.
+    Unlike a sequential scan, this does not stop at the first gap, so
+    non-sequential USB devices on Windows are detected correctly.
 
-    :return: The number of connected cameras.
+    :param max_index: Highest device index to probe (exclusive).
+    :type max_index: int
+    :return: List of working device indices.
+    :rtype: list[int]
+    """
+
+    found = []
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            cap.release()
+            if ret:
+                found.append(i)
+        else:
+            cap.release()
+    return found
+
+
+# Path to persistent camera registry
+CAMERAS_JSON = os.path.join(landmarker.BASE_DIR, "cameras.json")
+
+
+def load_cameras() -> list:
+    """
+    Loads the camera registry from cameras.json.
+    On first run (file absent), auto-detects local cameras and writes the file.
+
+    :return: List of camera dicts with keys: id, source, name.
+    :rtype: list[dict]
+    """
+
+    if os.path.exists(CAMERAS_JSON):
+        with open(CAMERAS_JSON, "r") as f:
+            return json.load(f)
+
+    # First run: auto-detect and persist
+    cams = []
+    for idx in scan_local_cameras():
+        cams.append({"id": idx, "source": idx, "name": f"Camera {idx + 1}"})
+    save_cameras(cams)
+    return cams
+
+
+def save_cameras(cams: list) -> None:
+    """
+    Persists the camera registry to cameras.json.
+
+    :param cams: List of camera dicts to save.
+    :type cams: list[dict]
+    """
+
+    with open(CAMERAS_JSON, "w") as f:
+        json.dump(cams, f, indent=2)
+
+
+def _next_cam_id(cams: list) -> int:
+    """
+    Returns the next available camera ID.
+
+    :param cams: Current camera list.
+    :type cams: list[dict]
+    :return: Next available integer ID.
     :rtype: int
     """
 
-    index = 0
-    while True:
-        cap = cv2.VideoCapture(index)
-        ret, _ = cap.read()
-        cap.release()
-        if not ret:
-            break
-        index += 1
-    return index
+    return max((c["id"] for c in cams), default=-1) + 1
 
 
 # Videowriter setup
@@ -409,39 +464,53 @@ def index() -> str:
     :rtype: str
     """
 
+    cams = load_cameras()
     output = ""
-    for i in range(find_cameras()):
+    for cam in cams:
+        cam_id = cam["id"]
+        cam_name = cam["name"]
+        cam_source = cam["source"]
         output += f"""
-            <h2>Camera {i+1}</h2>
-            <img src='/video_feed/{i}' width='100%'>
-            <p>{Alert.query.filter_by(cam_no=str(i)).count()} alerts</p>
-            <a href="/alerts/{i}" class="btn btn-primary">View Alerts</a><hr>
-            <form method="post" action="/clear_alerts/{i}" style="display:inline;">
+            <h2>{cam_name}</h2>
+            <img src='/video_feed/{cam_id}' width='100%'>
+            <p>{Alert.query.filter_by(cam_no=str(cam_source)).count()} alerts</p>
+            <a href="/alerts/{cam_source}" class="btn btn-primary">View Alerts</a>&nbsp;
+            <form method="post" action="/clear_alerts/{cam_source}" style="display:inline;">
                 <button type="submit" class="btn btn-danger">Clear Alerts</button>
+            </form>&nbsp;
+            <form method="post" action="/remove_camera/{cam_id}" style="display:inline;">
+                <button type="submit" class="btn btn-warning">Remove Camera</button>
             </form><hr>
         """
 
     return render_template("index.html", content=output, alerts=Alert.query.all())
 
 
-@app.route("/video_feed/<path:cam_no>")
-def video_feed(cam_no: str) -> Response:
+@app.route("/video_feed/<int:cam_id>")
+def video_feed(cam_id: int) -> Response:
     """
     Route to serve the video feed for a specific camera.
 
-    :param cam_no: The camera number or path to the video feed.
+    :param cam_id: The registry ID of the camera to stream.
+    :type cam_id: int
 
     :return: A streaming response containing the video feed.
     :rtype: Response
     """
 
-    # Allow numeric device indices or full URL/device paths.
-    if cam_no.isdigit():
-        cam_no = int(cam_no)
+    cams = load_cameras()
+    entry = next((c for c in cams if c["id"] == cam_id), None)
+    if entry is None:
+        return "Camera not found", 404
+
+    # Resolve source: stored integers stay int, digit-strings are coerced, URLs stay str.
+    source = entry["source"]
+    if isinstance(source, str) and source.isdigit():
+        source = int(source)
 
     # Return the video feed as a multipart response.
     return app.response_class(
-        generate_frames(cam_no), mimetype="multipart/x-mixed-replace; boundary=frame"
+        generate_frames(source), mimetype="multipart/x-mixed-replace; boundary=frame"
     )
 
 
@@ -641,6 +710,66 @@ def download_all_alerts() -> Response:
         as_attachment=True,
         download_name="all_alert_evidence.zip",
     )
+
+
+@app.route("/add_camera", methods=["POST"])
+def add_camera() -> Response:
+    """
+    Adds a new camera to the registry.
+    Accepts a ``source`` (integer index or URL string) and an optional ``name``.
+
+    :return: Redirect to the main page.
+    :rtype: Response
+    """
+
+    source = request.form.get("source", "").strip()
+    name = request.form.get("name", "").strip() or f"Camera {source}"
+    if not source:
+        return "No source provided", 400
+
+    # Coerce digit strings to int so OpenCV receives the right type.
+    parsed = int(source) if source.isdigit() else source
+
+    cams = load_cameras()
+    cams.append({"id": _next_cam_id(cams), "source": parsed, "name": name})
+    save_cameras(cams)
+    return redirect("/")
+
+
+@app.route("/remove_camera/<int:cam_id>", methods=["POST"])
+def remove_camera(cam_id: int) -> Response:
+    """
+    Removes a camera from the registry by its ID.
+
+    :param cam_id: The registry ID of the camera to remove.
+    :type cam_id: int
+
+    :return: Redirect to the main page.
+    :rtype: Response
+    """
+
+    cams = [c for c in load_cameras() if c["id"] != cam_id]
+    save_cameras(cams)
+    return redirect("/")
+
+
+@app.route("/refresh_cameras", methods=["POST"])
+def refresh_cameras() -> Response:
+    """
+    Re-scans local (wired/USB) cameras and adds any newly discovered ones to the registry.
+    Cameras already in the registry are left unchanged.
+
+    :return: Redirect to the main page.
+    :rtype: Response
+    """
+
+    cams = load_cameras()
+    existing_sources = {c["source"] for c in cams}
+    for idx in scan_local_cameras():
+        if idx not in existing_sources:
+            cams.append({"id": _next_cam_id(cams), "source": idx, "name": f"Camera {idx + 1}"})
+    save_cameras(cams)
+    return redirect("/")
 
 
 # Run the Flask app

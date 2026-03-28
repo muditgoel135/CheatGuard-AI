@@ -24,22 +24,36 @@
         {{ content|safe }}
     </main>
 
+    <!-- Camera management -->
+    <section class="mt-3">
+        <h3>Manage Cameras</h3>
+        <form method="post" action="/add_camera" class="row g-2 mb-2">
+            <div class="col-auto">
+                <input type="text" name="source" class="form-control"
+                    placeholder="Index (0, 1 …) or rtsp://… / http://…" required>
+            </div>
+            <div class="col-auto">
+                <input type="text" name="name" class="form-control" placeholder="Camera name (optional)">
+            </div>
+            <div class="col-auto">
+                <button type="submit" class="btn btn-success">Add Camera</button>
+            </div>
+        </form>
+        <form method="post" action="/refresh_cameras">
+            <button type="submit" class="btn btn-secondary">Refresh Local Cameras</button>
+        </form>
+    </section>
+    <hr>
+
     <!-- Display all alerts -->
     <section>
         <h2>All Alerts</h2>
         <ul>
             {% for alert in alerts %}
-            {% if alert.cam_no.isdigit() %}
             <li>
-                <strong>Camera {{ alert.cam_no|int + 1 }}</strong>:
+                <strong>{% if alert.cam_no.isdigit() %}Camera {{ alert.cam_no|int + 1 }}{% else %}Camera path {{ alert.cam_no }}{% endif %}</strong>:
                 <u>{{ alert.alert_type }}</u> at {{ alert.timestamp }}
             </li>
-            {% else %}
-            <li>
-                <strong>Camera path {{ alert.cam_no }}</strong>:
-                <u>{{ alert.alert_type }}</u> at {{ alert.timestamp }}
-            </li>
-            {% endif %}
             {% endfor %}
         </ul>
 
