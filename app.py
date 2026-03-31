@@ -16,6 +16,7 @@ Separation of concerns:
 # Import necessary libraries
 import base64
 import json
+from dotenv import load_dotenv
 from flask import (
     Flask,
     Response,
@@ -33,6 +34,9 @@ from io import BytesIO
 import zipfile
 import camera_processor
 
+
+# Load environment variables
+load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)

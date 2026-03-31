@@ -208,15 +208,45 @@ The registry is stored as plain JSON alongside the application rather than in SQ
 
 ## Configuration
 
-The following constants in `camera_processor.py` control detection behaviour:
+All tunable settings are controlled via the `.env` file. Create or edit `.env` in the project root (alongside `app.py`) — values are loaded at startup before any camera thread is started.
 
-| Constant | Default | Description |
-| --- | --- | --- |
-| `INFERENCE_EVERY_N` | `2` | Run ML inference on every Nth frame |
-| `STREAM_TARGET_FPS` | `30` | Max frames per second sent to the browser |
-| `JPEG_PARAMS` | quality 70 | JPEG encoding quality for the stream |
+### `.env` variables
 
-The alert thresholds (3 seconds for both No Face and Hand Raised) are hardcoded in the `_process_camera()` function as `datetime.timedelta(seconds=3)`.
+| Variable | Default | Type | Description |
+| --- | --- | --- | --- |
+| `SECRET_KEY` | *(required)* | `str` | Flask session secret key — set to a long random string |
+| `NO_FACE_ALERT_SECONDS` | `3` | `int` | Seconds without a face before a "No Face Detected" alert fires |
+| `HAND_RAISED_ALERT_SECONDS` | `3` | `int` | Seconds a hand must be raised before a "Hand Raised" alert fires |
+| `FACE_DETECTION_CONFIDENCE` | `0.5` | `float` | Minimum MediaPipe face-detector confidence score to count as a detection |
+| `HAND_DETECTION_CONFIDENCE` | `0.5` | `float` | Minimum MediaPipe hand-landmarker handedness score to count as a detection |
+| `INFERENCE_EVERY_N` | `2` | `int` | Run ML inference on every Nth captured frame; other frames reuse the last result |
+| `STREAM_TARGET_FPS` | `30` | `int` | Maximum frames per second delivered to the browser via MJPEG |
+| `JPEG_QUALITY` | `70` | `int` | JPEG encoding quality for the stream (1–100; lower = smaller, faster) |
+| `EVIDENCE_VIDEO_FPS` | `15.0` | `float` | Frame rate used when writing evidence MP4 files to disk |
+| `EVIDENCE_VIDEO_CODEC` | `mp4v` | `str` | FourCC codec string passed to `cv2.VideoWriter_fourcc` for evidence videos |
+
+### Example `.env`
+
+```text
+SECRET_KEY=your-secret-key-here
+
+# Alert thresholds
+NO_FACE_ALERT_SECONDS=3
+HAND_RAISED_ALERT_SECONDS=3
+
+# Detection confidence thresholds
+FACE_DETECTION_CONFIDENCE=0.5
+HAND_DETECTION_CONFIDENCE=0.5
+
+# Performance
+INFERENCE_EVERY_N=2
+STREAM_TARGET_FPS=30
+JPEG_QUALITY=70
+
+# Evidence recording
+EVIDENCE_VIDEO_FPS=15.0
+EVIDENCE_VIDEO_CODEC=mp4v
+```
 
 ---
 

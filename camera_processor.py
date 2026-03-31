@@ -26,8 +26,17 @@ import threading
 from collections import deque
 from threading import Lock
 
+
+# Configurable thresholds and settings — override via .env
+NO_FACE_ALERT_SECONDS = int(os.environ.get("NO_FACE_ALERT_SECONDS", 3))
+HAND_RAISED_ALERT_SECONDS = int(os.environ.get("HAND_RAISED_ALERT_SECONDS", 3))
+FACE_DETECTION_CONFIDENCE = float(os.environ.get("FACE_DETECTION_CONFIDENCE", 0.5))
+HAND_DETECTION_CONFIDENCE = float(os.environ.get("HAND_DETECTION_CONFIDENCE", 0.5))
+EVIDENCE_VIDEO_FPS = float(os.environ.get("EVIDENCE_VIDEO_FPS", 15.0))
+EVIDENCE_VIDEO_CODEC = os.environ.get("EVIDENCE_VIDEO_CODEC", "mp4v")
+
 # Videowriter setup
-forucc = cv2.VideoWriter_fourcc(*"mp4v")
+forucc = cv2.VideoWriter_fourcc(*EVIDENCE_VIDEO_CODEC)
 
 # Create output directory for evidence videos if it doesn't exist.
 output_dir = os.path.join(landmarker.BASE_DIR, "output")
@@ -62,13 +71,13 @@ _threads_lock = Lock()
 # Run ML inference only once every N frames to improve throughput.
 # Frames in between reuse the previous inference result — good enough at 30 fps
 # because subjects don't move faster than the detector's effective range.
-INFERENCE_EVERY_N = 2
+INFERENCE_EVERY_N = int(os.environ.get("INFERENCE_EVERY_N", 2))
 
 # Maximum frames per second delivered to the browser.
-STREAM_TARGET_FPS = 30
+STREAM_TARGET_FPS = int(os.environ.get("STREAM_TARGET_FPS", 30))
 
 # JPEG encode parameters (quality 70 balances size vs. fidelity).
-JPEG_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, 70]
+JPEG_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, int(os.environ.get("JPEG_QUALITY", 70))]
 
 # Injected Flask references — set by calling init().
 # Stored at module level so the background threads (which have no request context)
@@ -150,7 +159,7 @@ def _process_camera(cam_key) -> None:
             f"evidence_cam{cam_key}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4",
         )
         h, w = queued_frames[0].shape[:2]
-        out = cv2.VideoWriter(release_path, forucc, 15.0, (w, h))
+        out = cv2.VideoWriter(release_path, forucc, EVIDENCE_VIDEO_FPS, (w, h))
         if not out.isOpened():
             print(f"Failed to open VideoWriter for {release_path}")
             return
@@ -238,7 +247,10 @@ def _process_camera(cam_key) -> None:
                     fdr = face_detector.detect(mp_image)
                     if not fdr.detections:
                         face_detected = False
-                    elif fdr.detections[0].categories[0].score > 0.5:
+                    elif (
+                        fdr.detections[0].categories[0].score
+                        > FACE_DETECTION_CONFIDENCE
+                    ):
                         face_detected = True
                     else:
                         face_detected = False
@@ -272,7 +284,8 @@ def _process_camera(cam_key) -> None:
                         current_state = state_by_cam.get(cam_key)
                     t2 = datetime.datetime.now()
                     if (
-                        t2 - no_face_start >= datetime.timedelta(seconds=3)
+                        t2 - no_face_start
+                        >= datetime.timedelta(seconds=NO_FACE_ALERT_SECONDS)
                         and current_state != "No Face Detected"
                     ):
                         alert("No Face Detected", frame)
@@ -284,7 +297,8 @@ def _process_camera(cam_key) -> None:
                 if (
                     last_hand_result is not None
                     and last_hand_result.hand_landmarks
-                    and last_hand_result.handedness[0][0].score > 0.5
+                    and last_hand_result.handedness[0][0].score
+                    > HAND_DETECTION_CONFIDENCE
                 ):
                     if rgb_frame is None:
                         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -297,7 +311,8 @@ def _process_camera(cam_key) -> None:
                         current_state = state_by_cam.get(cam_key, "")
                     t2 = datetime.datetime.now()
                     if (
-                        t2 - hand_start >= datetime.timedelta(seconds=3)
+                        t2 - hand_start
+                        >= datetime.timedelta(seconds=HAND_RAISED_ALERT_SECONDS)
                         and current_state == "IDLE"
                         and face_detected
                     ):
