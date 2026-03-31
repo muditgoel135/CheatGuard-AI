@@ -323,8 +323,6 @@ def _process_camera(cam_key) -> None:
                 else:
                     with state_lock:
                         t1_hand_by_cam.pop(cam_key, None)
-                        if state_by_cam.get(cam_key) == "Hand Raised" and face_detected:
-                            state_by_cam[cam_key] = "IDLE"
 
                 # All landmark drawing functions modify rgb_frame in-place.
                 # We defer the single BGR conversion to here so we only pay the
