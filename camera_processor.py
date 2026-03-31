@@ -273,7 +273,8 @@ def _process_camera(cam_key) -> None:
                     drew_anything = True
                     with state_lock:
                         t1_by_cam.pop(cam_key, None)
-                        state_by_cam[cam_key] = "IDLE"
+                        if state_by_cam.get(cam_key) != "Hand Raised":
+                            state_by_cam[cam_key] = "IDLE"
                     stop_recording()
                 elif not face_detected:
                     with state_lock:
