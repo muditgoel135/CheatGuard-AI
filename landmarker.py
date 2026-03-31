@@ -1,3 +1,16 @@
+"""
+landmarker.py — MediaPipe model configuration and landmark drawing helpers.
+
+Exposes three pre-configured MediaPipe task objects ready for use in IMAGE mode:
+    face_detector_options   — short-range face detection (presence check).
+    face_landmark_options   — 478-point face mesh (used for gaze/pose analysis).
+    hand_landmark_options   — 21-point hand skeleton for up-to-2 hands.
+
+Drawing helpers (draw_face_landmarks_on_image, draw_hand_landmarks_on_image) modify the passed RGB ndarray in-place and also return it for convenience.
+
+All model paths are resolved relative to BASE_DIR (this file's directory) so the package works regardless of the working directory at launch.
+"""
+
 # Import necessary libraries
 import os
 import numpy as np
@@ -59,7 +72,9 @@ hand_landmark_options = HandLandmarkerOptions(
 )
 
 
-# Pre-compute drawing styles once at import time instead of recreating them every frame.
+# Drawing style objects are built once at import time.  Each call to
+# get_default_*_style() allocates new Python objects; caching them here avoids
+# thousands of small allocations per second at 30 fps across multiple cameras.
 _TESSELATION_STYLE = drawing_styles.get_default_face_mesh_tesselation_style()
 _CONTOURS_STYLE = drawing_styles.get_default_face_mesh_contours_style()
 _IRIS_STYLE = drawing_styles.get_default_face_mesh_iris_connections_style()
@@ -120,8 +135,15 @@ def draw_face_landmarks_on_image(
     for idx in range(len(face_landmarks_list)):
         face_landmarks = face_landmarks_list[idx]
 
-        # Draw the face landmarks on the image.
-        # Tesselation
+        # Three-pass drawing pipeline — each pass uses a different connection set
+        # so MediaPipe can apply distinct colours/thicknesses to each layer:
+        #   1. Tesselation — the fine triangle mesh covering the whole face surface.
+        #   2. Contours    — the bold outline edges (jawline, eyes, lips, etc.).
+        #   3. Irises      — small circles around each iris centre point.
+        # landmark_drawing_spec=None suppresses individual landmark dots so only
+        # the connection lines are rendered, keeping the overlay uncluttered.
+
+        # Pass 1: tesselation
         drawing_utils.draw_landmarks(
             image=annotated_image,
             landmark_list=face_landmarks,
@@ -130,7 +152,7 @@ def draw_face_landmarks_on_image(
             connection_drawing_spec=_TESSELATION_STYLE,
         )
 
-        # Contours
+        # Pass 2: contours
         drawing_utils.draw_landmarks(
             image=annotated_image,
             landmark_list=face_landmarks,
@@ -139,7 +161,7 @@ def draw_face_landmarks_on_image(
             connection_drawing_spec=_CONTOURS_STYLE,
         )
 
-        # Irises
+        # Pass 3: irises (left and right drawn separately as they share the same style)
         drawing_utils.draw_landmarks(
             image=annotated_image,
             landmark_list=face_landmarks,
