@@ -1,7 +1,15 @@
 # Import necessary libraries
 import base64
 import json
-from flask import Flask, Response, render_template, send_file, send_from_directory, redirect, request
+from flask import (
+    Flask,
+    Response,
+    render_template,
+    send_file,
+    send_from_directory,
+    redirect,
+    request,
+)
 from flask_sqlalchemy import SQLAlchemy
 import cv2
 import datetime
@@ -12,6 +20,8 @@ import landmarker
 from collections import deque
 from io import BytesIO
 import zipfile
+import time
+import threading
 from threading import Lock
 
 
@@ -39,6 +49,7 @@ class Alert(db.Model):
     def __repr__(self) -> str:
         """
         String representation of the Alert object for debugging and display purposes.
+
         :return: A string representation of the Alert object, including camera number, timestamp, and alert type.
         :rtype: str
         """
@@ -144,107 +155,79 @@ evidence_queue_by_cam = {}  # Optional: To store recent frames for evidence if n
 alert_evidence_paths = []
 state_lock = Lock()
 
+# Per-camera streaming cache: background threads write, generators read.
+_jpeg_cache: dict = {}
+_cache_lock = Lock()
+_processor_threads: dict = {}
+_threads_lock = Lock()
 
-# Function to generate video frames and process them for face detection and landmarking
-def generate_frames(cam_key):
+# Run ML inference only once every N frames to improve throughput.
+INFERENCE_EVERY_N = 2
+
+# Maximum frames per second delivered to the browser.
+STREAM_TARGET_FPS = 30
+
+# JPEG encode parameters (quality 70 balances size vs. fidelity).
+JPEG_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, 70]
+
+
+def _process_camera(cam_key) -> None:
     """
-    Generates video frames from the specified camera and processes them for face detection and landmarking.
+    Background thread: captures frames, runs ML inference every
+    INFERENCE_EVERY_N frames, draws annotations, and stores the latest
+    JPEG bytes in _jpeg_cache for generate_frames() to stream independently.
 
-    :param cam_key: The key (index or URL/path) of the camera to process.
-    :type cam_key: int or str
+    :param cam_key: Integer device index or URL/path string for the camera.
     """
-
-    # Define global variables
     global t1_by_cam, t1_hand_by_cam, state_by_cam, recording_by_cam, evidence_queue_by_cam, forucc, alert_evidence_paths
 
-    # Define the start time for FPS calculation.
-    start = datetime.datetime.now()
+    # Use CAP_DSHOW on Windows for integer indices (lower latency); FFMPEG for URLs.
+    backend = cv2.CAP_DSHOW if isinstance(cam_key, int) else cv2.CAP_ANY
+    cam = cv2.VideoCapture(cam_key, backend)
+    attempts = 0
+    while not cam.isOpened():
+        attempts += 1
+        if attempts > 5:
+            print(f"Camera {cam_key}: failed to open after 5 attempts.")
+            return
+        cam = cv2.VideoCapture(cam_key, backend)
+        time.sleep(1)
+    print(f"Camera {cam_key}: ready")
 
-    # Initialize state and timers for this camera if not already done.
     with state_lock:
-        # Reset the camera state to IDLE when the camera feed starts.
         state_by_cam[cam_key] = "IDLE"
-
-        # Initialize recording state and evidence queue for this camera.
         recording_by_cam[cam_key] = False
         evidence_queue_by_cam[cam_key] = deque()
 
-    def alert(alert_type: str, frame: np.ndarray):
-        """
-        Saves an alert to the database.
-
-        :param alert_type: Description
-        :param frame: Description
-        """
-
+    def alert(alert_type: str, frame: np.ndarray) -> None:
         print(f"ALERT: {alert_type} at {datetime.datetime.now()}")
-
-        # Convert frame to bytes
         _, buffer = cv2.imencode(".png", frame)
-        alert_image = buffer.tobytes()
-
-        # Create new alert and save to database
         new_alert = Alert(
             alert_type=alert_type,
-            alert_image=alert_image,
+            alert_image=buffer.tobytes(),
             cam_no=str(cam_key),
             timestamp=datetime.datetime.now(),
         )
-
-        # Use app context to ensure the database session is available
         with app.app_context():
             db.session.add(new_alert)
             db.session.commit()
 
-    def stop_recording():
-        """
-        Stops recording and clears and saves the evidence queue for the camera.
-        """
-
-        with state_lock:
-            # Get the queued frames for this camera and clear the queue and recording state.
-            queued_frames = list(evidence_queue_by_cam.get(cam_key, deque()))
-
-            # Ensure that there are queued frames to save
-            if not queued_frames:
-                return
-
-            # Reset recording state and clear the evidence queue for this camera.
-            recording_by_cam[cam_key] = False
-            evidence_queue_by_cam[cam_key] = deque()
-
-        # Create a video file from the queued frames and save it to the output directory with a timestamped filename.
+    def _save_evidence(queued_frames: list) -> None:
+        """Writes evidence frames to MP4; runs in its own daemon thread so it
+        never blocks the capture loop."""
         release_path = os.path.join(
             output_dir,
             f"evidence_cam{cam_key}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4",
         )
-
-        height, width = queued_frames[0].shape[:2]
-        out = cv2.VideoWriter(
-            release_path,
-            forucc,
-            15.0,
-            (width, height),
-        )
-
-        # Check if the VideoWriter was successfully opened before attempting to write frames.
+        h, w = queued_frames[0].shape[:2]
+        out = cv2.VideoWriter(release_path, forucc, 15.0, (w, h))
         if not out.isOpened():
             print(f"Failed to open VideoWriter for {release_path}")
             return
-
-        # Append each frame in the queued frames to the video file.
-        for frame in queued_frames:
-            out.write(frame)
-
-        # Release the VideoWriter to ensure the video file is properly saved and closed.
+        for f in queued_frames:
+            out.write(f)
         out.release()
-
-        # Only expose evidence file if video writing succeeded.
-        if (
-            os.path.exists(release_path)
-            and os.path.getsize(release_path) > 0
-            and os.path.isfile(release_path)
-        ):
+        if os.path.exists(release_path) and os.path.getsize(release_path) > 0:
             with state_lock:
                 base = os.path.basename(release_path)
                 if base not in alert_evidence_paths:
@@ -252,171 +235,163 @@ def generate_frames(cam_key):
         else:
             print(f"Failed to save evidence video for camera {cam_key}")
 
-    # Initialize video capture
-    cam = cv2.VideoCapture(cam_key)
-    attempts = 0
+    def stop_recording() -> None:
+        """Grabs queued frames under the lock, then offloads MP4 writing to a
+        daemon thread so the capture loop is never blocked by disk I/O."""
+        with state_lock:
+            queued_frames = list(evidence_queue_by_cam.get(cam_key, deque()))
+            if not queued_frames:
+                return
+            recording_by_cam[cam_key] = False
+            evidence_queue_by_cam[cam_key] = deque()
+        threading.Thread(
+            target=_save_evidence, args=(queued_frames,), daemon=True
+        ).start()
 
-    # Wait until the camera is opened, with a maximum of 5 attempts.
-    while not cam.isOpened():
-        attempts += 1
-        if attempts > 5:
-            print(f"Failed to open camera {cam_key} after 5 attempts. Exiting.")
-            return "Failed to open camera."
-        cam = cv2.VideoCapture(cam_key)
-        cv2.waitKey(1000)
-    print("Camera is ready")
+    frame_counter = 0
+    last_face_detected = False
+    last_landmark_result = None
+    last_hand_result = None
+    fps_history: deque = deque(maxlen=15)  # rolling window for smoothed FPS
+    t_prev = time.monotonic()
 
-    # Use Face Detector and Face Landmarker
     try:
-        # Use context managers to ensure proper resource management of the detectors and landmarkers.
         with (
-            # Context manager for face detector
             landmarker.FaceDetector.create_from_options(
                 landmarker.face_detector_options
             ) as face_detector,
-            # Context manager for face landmarker
             landmarker.FaceLandmarker.create_from_options(
                 landmarker.face_landmark_options
             ) as face_landmarker,
-            # Context manager for hand landmarker
             landmarker.HandLandmarker.create_from_options(
                 landmarker.hand_landmark_options
             ) as hand_landmarker,
         ):
-            # Main loop to process video frames
             while True:
-                # Read frame from camera
                 ret, frame = cam.read()
-
-                # If frame not grabbed, break the loop
                 if not ret:
-                    print("Failed to grab frame")
-                    break
+                    time.sleep(0.05)
+                    continue
 
-                # If currently recording for this camera, append the current frame to the evidence queue for this camera.
+                # Record the pre-flip raw frame for evidence
                 with state_lock:
-                    if recording_by_cam.get(cam_key) is True:
+                    if recording_by_cam.get(cam_key):
                         evidence_queue_by_cam[cam_key].append(frame)
 
-                # Edit the frame to make it suitable for processing
                 frame = cv2.flip(frame, 1)
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_counter += 1
+                run_inference = frame_counter % INFERENCE_EVERY_N == 0
 
-                # Create a MediaPipe Image object from the frame
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                # Convert to RGB only when inference or active detections require it;
+                # skips the conversion on quiet frames with no detections.
+                needs_rgb = (
+                    run_inference
+                    or (last_face_detected and last_landmark_result is not None)
+                    or (
+                        last_hand_result is not None and last_hand_result.hand_landmarks
+                    )
+                )
+                rgb_frame = (
+                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if needs_rgb else None
+                )
 
-                # Perform face detection (synchronous)
-                face_detection_result = face_detector.detect(mp_image)
-
-                # Ensure that the detection result detects a face
-                if not face_detection_result.detections:
-                    face_detected = False
-
-                # Ensure that the detection result has a valid score for the detected face before proceeding with landmarking and state updates.
-                elif face_detection_result.detections[0].categories[0].score > 0.5:
-                    face_detected = True
-
-                # If the detection result does not have a valid score for the detected face, treat it as no face detected.
-                else:
-                    face_detected = False
-
-                # Perform face landmarking if a face is detected
-                if face_detected:
-                    # Convert the frame to RGB format for processing with MediaPipe.
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                    # Detect face landmarks and draw them on the current frame.
-                    landmark_result = face_landmarker.detect(mp_image)
-                    annotated_image = landmarker.draw_face_landmarks_on_image(
-                        rgb_frame, landmark_result
+                if run_inference and rgb_frame is not None:
+                    mp_image = mp.Image(
+                        image_format=mp.ImageFormat.SRGB, data=rgb_frame
                     )
 
-                    # Save the annotated frame and convert it back to BGR format for display and saving.
-                    frame = cv2.cvtColor(annotated_image, cv2.COLOR_RGB2BGR)
+                    fdr = face_detector.detect(mp_image)
+                    if not fdr.detections:
+                        face_detected = False
+                    elif fdr.detections[0].categories[0].score > 0.5:
+                        face_detected = True
+                    else:
+                        face_detected = False
 
-                    # Face is back, so reset the no-face timer/state for this camera.
+                    last_landmark_result = (
+                        face_landmarker.detect(mp_image) if face_detected else None
+                    )
+                    last_hand_result = hand_landmarker.detect(mp_image)
+                    last_face_detected = face_detected
+                else:
+                    face_detected = last_face_detected
+
+                drew_anything = False
+
+                # Face landmarks + state machine
+                if face_detected and last_landmark_result is not None:
+                    landmarker.draw_face_landmarks_on_image(
+                        rgb_frame, last_landmark_result
+                    )
+                    drew_anything = True
                     with state_lock:
                         t1_by_cam.pop(cam_key, None)
                         state_by_cam[cam_key] = "IDLE"
                     stop_recording()
-
-                # Handle no face detected scenario
-                else:
-                    # Implement a timer to check if no face is detected for 3 seconds
+                elif not face_detected:
                     with state_lock:
-                        # Ensure that the timer for exists in the global dictionary for this camera, and if not, initialize it to the current time.
                         if cam_key not in t1_by_cam:
                             t1_by_cam[cam_key] = datetime.datetime.now()
                         no_face_start = t1_by_cam[cam_key]
                         recording_by_cam[cam_key] = True
                         current_state = state_by_cam.get(cam_key)
                     t2 = datetime.datetime.now()
-
-                    # Check if 3 seconds have passed
                     if (
                         t2 - no_face_start >= datetime.timedelta(seconds=3)
                         and current_state != "No Face Detected"
                     ):
-                        # Alert the user and save the frame
-                        alert_type = "No Face Detected"
-                        alert(alert_type, frame)
-
-                        # Update the state to "No Face Detected" and reset the timer for this camera.
+                        alert("No Face Detected", frame)
                         with state_lock:
                             state_by_cam[cam_key] = "No Face Detected"
                             t1_by_cam[cam_key] = t2
 
-                # Perform hand landmarking to check for raised hand
-                hand_landmark_result = hand_landmarker.detect(mp_image)
-                if hand_landmark_result.hand_landmarks and (
-                    hand_landmark_result.handedness[0][0].score > 0.5
+                # Hand landmarks + state machine
+                if (
+                    last_hand_result is not None
+                    and last_hand_result.hand_landmarks
+                    and last_hand_result.handedness[0][0].score > 0.5
                 ):
-                    # If hand landmarks are detected, draw them on the frame
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    annotated_image = landmarker.draw_hand_landmarks_on_image(
-                        rgb_frame, hand_landmark_result
-                    )
-
-                    # Save the annotated frame and convert it back to BGR format for display and saving.
-                    frame = cv2.cvtColor(annotated_image, cv2.COLOR_RGB2BGR)
-
-                    # Implement a timer to check if no face is detected for 3 seconds
+                    if rgb_frame is None:
+                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    landmarker.draw_hand_landmarks_on_image(rgb_frame, last_hand_result)
+                    drew_anything = True
                     with state_lock:
                         if cam_key not in t1_hand_by_cam:
                             t1_hand_by_cam[cam_key] = datetime.datetime.now()
                         hand_start = t1_hand_by_cam[cam_key]
                         current_state = state_by_cam.get(cam_key, "")
                     t2 = datetime.datetime.now()
-
-                    # Check if 3 seconds have passed
                     if (
                         t2 - hand_start >= datetime.timedelta(seconds=3)
                         and current_state == "IDLE"
                         and face_detected
                     ):
-                        # Alert the user and save the frame
-                        alert_type = "Hand Raised"
-                        alert(alert_type, frame)
-
-                        # Update the state to "Hand Raised" and reset the timer for this camera.
+                        alert("Hand Raised", frame)
                         with state_lock:
                             state_by_cam[cam_key] = "Hand Raised"
                             t1_hand_by_cam[cam_key] = t2
-
-                # No hand currently detected; reset timer and recover state.
                 else:
                     with state_lock:
                         t1_hand_by_cam.pop(cam_key, None)
                         if state_by_cam.get(cam_key) == "Hand Raised" and face_detected:
                             state_by_cam[cam_key] = "IDLE"
 
-                # Calculate FPS
-                time_diff = (datetime.datetime.now() - start).total_seconds()
+                # Single BGR conversion after all in-place RGB drawing
+                if drew_anything:
+                    frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
 
-                # Display the FPS on the frame
+                # Smoothed FPS using a rolling window (avoids single-frame spikes)
+                t_now = time.monotonic()
+                fps_history.append(1.0 / max(t_now - t_prev, 1e-6))
+                t_prev = t_now
+                fps = sum(fps_history) / len(fps_history)
+
+                with state_lock:
+                    state_label = state_by_cam.get(cam_key, "IDLE")
+
                 cv2.putText(
                     frame,
-                    f"FPS: {1/time_diff:.2f}",
+                    f"FPS: {fps:.1f}",
                     (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     1,
@@ -424,11 +399,6 @@ def generate_frames(cam_key):
                     2,
                     cv2.LINE_AA,
                 )
-
-                # Display the current state on the frame
-                with state_lock:
-                    state_label = state_by_cam.get(cam_key, "IDLE")
-
                 cv2.putText(
                     frame,
                     f"State: {state_label}",
@@ -440,18 +410,51 @@ def generate_frames(cam_key):
                     cv2.LINE_AA,
                 )
 
-                # Reset FPS calculation time
-                start = datetime.datetime.now()
-
-                # Show the frame
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n"
-                    + cv2.imencode(".jpg", frame)[1].tobytes()
-                    + b"\r\n"
-                )
+                _, buf = cv2.imencode(".jpg", frame, JPEG_PARAMS)
+                with _cache_lock:
+                    _jpeg_cache[cam_key] = buf.tobytes()
     finally:
         cam.release()
+        with _cache_lock:
+            _jpeg_cache.pop(cam_key, None)
+
+
+def _ensure_processor(cam_key) -> None:
+    """Starts the background processing thread for cam_key if not already running."""
+    with _threads_lock:
+        t = _processor_threads.get(cam_key)
+        if t is None or not t.is_alive():
+            t = threading.Thread(
+                target=_process_camera,
+                args=(cam_key,),
+                daemon=True,
+                name=f"cam-processor-{cam_key}",
+            )
+            _processor_threads[cam_key] = t
+            t.start()
+
+
+def generate_frames(cam_key):
+    """
+    Streams the latest processed JPEG for cam_key at up to STREAM_TARGET_FPS.
+    All capture and ML inference is handled by a background thread so this
+    generator never blocks on camera I/O or model inference — giving smooth,
+    stable output regardless of how long a single inference takes.
+
+    :param cam_key: Integer device index or URL/path string for the camera.
+    """
+    _ensure_processor(cam_key)
+    interval = 1.0 / STREAM_TARGET_FPS
+    while True:
+        t0 = time.monotonic()
+        with _cache_lock:
+            jpeg = _jpeg_cache.get(cam_key)
+        if jpeg is not None:
+            yield (b"--frame\r\n" b"Content-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n")
+        elapsed = time.monotonic() - t0
+        remaining = interval - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
 
 
 # Flask routes
@@ -767,11 +770,13 @@ def refresh_cameras() -> Response:
     existing_sources = {c["source"] for c in cams}
     for idx in scan_local_cameras():
         if idx not in existing_sources:
-            cams.append({"id": _next_cam_id(cams), "source": idx, "name": f"Camera {idx + 1}"})
+            cams.append(
+                {"id": _next_cam_id(cams), "source": idx, "name": f"Camera {idx + 1}"}
+            )
     save_cameras(cams)
     return redirect("/")
 
 
 # Run the Flask app
 if __name__ == "__main__":
-    app.run()
+    app.run(threaded=True)

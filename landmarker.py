@@ -59,6 +59,14 @@ hand_landmark_options = HandLandmarkerOptions(
 )
 
 
+# Pre-compute drawing styles once at import time instead of recreating them every frame.
+_TESSELATION_STYLE = drawing_styles.get_default_face_mesh_tesselation_style()
+_CONTOURS_STYLE = drawing_styles.get_default_face_mesh_contours_style()
+_IRIS_STYLE = drawing_styles.get_default_face_mesh_iris_connections_style()
+_HAND_LANDMARKS_STYLE = drawing_styles.get_default_hand_landmarks_style()
+_HAND_CONNECTIONS_STYLE = drawing_styles.get_default_hand_connections_style()
+
+
 def draw_hand_landmarks_on_image(
     rgb_image: np.ndarray, detection_result: HandLandmarkerResult
 ) -> np.ndarray:
@@ -73,7 +81,7 @@ def draw_hand_landmarks_on_image(
     """
 
     hand_landmarks_list = detection_result.hand_landmarks
-    annotated_image = np.copy(rgb_image)
+    annotated_image = rgb_image  # draw in-place; caller owns this array
 
     # Loop through the detected hands to visualize.
     for idx in range(len(hand_landmarks_list)):
@@ -84,8 +92,8 @@ def draw_hand_landmarks_on_image(
             image=annotated_image,
             landmark_list=hand_landmarks,
             connections=vision.HandLandmarksConnections.HAND_CONNECTIONS,
-            landmark_drawing_spec=drawing_styles.get_default_hand_landmarks_style(),
-            connection_drawing_spec=drawing_styles.get_default_hand_connections_style(),
+            landmark_drawing_spec=_HAND_LANDMARKS_STYLE,
+            connection_drawing_spec=_HAND_CONNECTIONS_STYLE,
         )
 
     # Return the annotated image with hand landmarks drawn on it.
@@ -106,7 +114,7 @@ def draw_face_landmarks_on_image(
     """
 
     face_landmarks_list = detection_result.face_landmarks
-    annotated_image = np.copy(rgb_image)
+    annotated_image = rgb_image  # draw in-place; caller owns this array
 
     # Loop through the detected faces to visualize.
     for idx in range(len(face_landmarks_list)):
@@ -119,7 +127,7 @@ def draw_face_landmarks_on_image(
             landmark_list=face_landmarks,
             connections=vision.FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
             landmark_drawing_spec=None,
-            connection_drawing_spec=drawing_styles.get_default_face_mesh_tesselation_style(),
+            connection_drawing_spec=_TESSELATION_STYLE,
         )
 
         # Contours
@@ -128,7 +136,7 @@ def draw_face_landmarks_on_image(
             landmark_list=face_landmarks,
             connections=vision.FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
             landmark_drawing_spec=None,
-            connection_drawing_spec=drawing_styles.get_default_face_mesh_contours_style(),
+            connection_drawing_spec=_CONTOURS_STYLE,
         )
 
         # Irises
@@ -137,7 +145,7 @@ def draw_face_landmarks_on_image(
             landmark_list=face_landmarks,
             connections=vision.FaceLandmarksConnections.FACE_LANDMARKS_LEFT_IRIS,
             landmark_drawing_spec=None,
-            connection_drawing_spec=drawing_styles.get_default_face_mesh_iris_connections_style(),
+            connection_drawing_spec=_IRIS_STYLE,
         )
 
         drawing_utils.draw_landmarks(
@@ -145,7 +153,7 @@ def draw_face_landmarks_on_image(
             landmark_list=face_landmarks,
             connections=vision.FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_IRIS,
             landmark_drawing_spec=None,
-            connection_drawing_spec=drawing_styles.get_default_face_mesh_iris_connections_style(),
+            connection_drawing_spec=_IRIS_STYLE,
         )
 
     # Return the annotated image with face landmarks drawn on it.
