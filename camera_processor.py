@@ -14,6 +14,7 @@ State machine (per camera):
 Call init(flask_app, db, Alert) once at startup to inject Flask dependencies before any camera thread is started.
 """
 
+# Import necessary libraries
 import cv2
 import datetime
 import numpy as np
