@@ -5,3 +5,8 @@ body.container {
 form {
     display: inline;
 }
+
+.sse-toast {
+    z-index: 9999;
+    display: none;
+}

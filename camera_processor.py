@@ -23,7 +23,7 @@ import os
 import landmarker
 import time
 import threading
-from collections import deque
+from collections import deque, OrderedDict
 from threading import Lock
 
 
@@ -34,6 +34,9 @@ FACE_DETECTION_CONFIDENCE = float(os.environ.get("FACE_DETECTION_CONFIDENCE", 0.
 HAND_DETECTION_CONFIDENCE = float(os.environ.get("HAND_DETECTION_CONFIDENCE", 0.5))
 EVIDENCE_VIDEO_FPS = float(os.environ.get("EVIDENCE_VIDEO_FPS", 15.0))
 EVIDENCE_VIDEO_CODEC = os.environ.get("EVIDENCE_VIDEO_CODEC", "mp4v")
+MAX_EVIDENCE_FRAMES = int(
+    os.environ.get("MAX_EVIDENCE_FRAMES", 4500)
+)  # ~5 min at 15 fps
 
 # Videowriter setup
 forucc = cv2.VideoWriter_fourcc(*EVIDENCE_VIDEO_CODEC)
@@ -54,30 +57,39 @@ t1_hand_by_cam = {}
 state_by_cam = {}
 recording_by_cam = {}
 evidence_queue_by_cam = {}
-alert_evidence_paths = []
+alert_evidence_paths: OrderedDict = OrderedDict()
+
+
 # Single lock protects all of the dicts above to avoid race conditions between
 # the capture thread and Flask request handlers reading state.
 state_lock = Lock()
+
 
 # MJPEG streaming cache — _process_camera() writes the latest JPEG bytes here;
 # generate_frames() reads from it.  A separate lock keeps writes and reads atomic.
 _jpeg_cache: dict = {}
 _cache_lock = Lock()
+
+
 # Registry of running processor threads so _ensure_processor() can check liveness
 # without starting duplicates.
 _processor_threads: dict = {}
 _threads_lock = Lock()
+
 
 # Run ML inference only once every N frames to improve throughput.
 # Frames in between reuse the previous inference result — good enough at 30 fps
 # because subjects don't move faster than the detector's effective range.
 INFERENCE_EVERY_N = int(os.environ.get("INFERENCE_EVERY_N", 2))
 
+
 # Maximum frames per second delivered to the browser.
 STREAM_TARGET_FPS = int(os.environ.get("STREAM_TARGET_FPS", 30))
 
+
 # JPEG encode parameters (quality 70 balances size vs. fidelity).
 JPEG_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, int(os.environ.get("JPEG_QUALITY", 70))]
+
 
 # Injected Flask references — set by calling init().
 # Stored at module level so the background threads (which have no request context)
@@ -136,7 +148,7 @@ def _process_camera(cam_key) -> None:
     with state_lock:
         state_by_cam[cam_key] = "IDLE"
         recording_by_cam[cam_key] = False
-        evidence_queue_by_cam[cam_key] = deque()
+        evidence_queue_by_cam[cam_key] = deque(maxlen=MAX_EVIDENCE_FRAMES)
 
     def alert(alert_type: str, frame: np.ndarray) -> None:
         print(f"ALERT: {alert_type} at {datetime.datetime.now()}")
@@ -150,10 +162,23 @@ def _process_camera(cam_key) -> None:
         with _app.app_context():
             _db.session.add(new_alert)
             _db.session.commit()
+        try:
+            import app as _app_module
+
+            _app_module._push_sse_event(
+                f'{{"cam": "{cam_key}", "type": "{alert_type}", "time": "{datetime.datetime.now().isoformat()}"}}'
+            )
+        except Exception:
+            pass
 
     def _save_evidence(queued_frames: list) -> None:
-        """Writes evidence frames to MP4; runs in its own daemon thread so it
-        never blocks the capture loop."""
+        """
+        Writes evidence frames to MP4; runs in its own daemon thread so it never blocks the capture loop.
+
+        :param queued_frames: List of raw frames to write to the evidence video.
+        :return: None
+        """
+
         release_path = os.path.join(
             output_dir,
             f"evidence_cam{cam_key}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4",
@@ -169,20 +194,23 @@ def _process_camera(cam_key) -> None:
         if os.path.exists(release_path) and os.path.getsize(release_path) > 0:
             with state_lock:
                 base = os.path.basename(release_path)
-                if base not in alert_evidence_paths:
-                    alert_evidence_paths.append(base)
+                alert_evidence_paths[base] = True
         else:
             print(f"Failed to save evidence video for camera {cam_key}")
 
     def stop_recording() -> None:
-        """Grabs queued frames under the lock, then offloads MP4 writing to a
-        daemon thread so the capture loop is never blocked by disk I/O."""
+        """
+        Grabs queued frames under the lock, then offloads MP4 writing to a
+        daemon thread so the capture loop is never blocked by disk I/O.
+
+        :return: None
+        """
         with state_lock:
             queued_frames = list(evidence_queue_by_cam.get(cam_key, deque()))
             if not queued_frames:
                 return
             recording_by_cam[cam_key] = False
-            evidence_queue_by_cam[cam_key] = deque()
+            evidence_queue_by_cam[cam_key] = deque(maxlen=MAX_EVIDENCE_FRAMES)
         threading.Thread(
             target=_save_evidence, args=(queued_frames,), daemon=True
         ).start()
@@ -212,12 +240,11 @@ def _process_camera(cam_key) -> None:
                     time.sleep(0.05)
                     continue
 
-                # Record the pre-flip raw frame for evidence
+                frame = cv2.flip(frame, 1)
+
                 with state_lock:
                     if recording_by_cam.get(cam_key):
                         evidence_queue_by_cam[cam_key].append(frame)
-
-                frame = cv2.flip(frame, 1)
                 frame_counter += 1
                 run_inference = frame_counter % INFERENCE_EVERY_N == 0
 
@@ -275,7 +302,9 @@ def _process_camera(cam_key) -> None:
                         t1_by_cam.pop(cam_key, None)
                         if state_by_cam.get(cam_key) != "Hand Raised":
                             state_by_cam[cam_key] = "IDLE"
-                    stop_recording()
+                        is_recording = recording_by_cam.get(cam_key, False)
+                    if is_recording:
+                        stop_recording()
                 elif not face_detected:
                     with state_lock:
                         if cam_key not in t1_by_cam:
@@ -324,6 +353,8 @@ def _process_camera(cam_key) -> None:
                 else:
                     with state_lock:
                         t1_hand_by_cam.pop(cam_key, None)
+                        if state_by_cam.get(cam_key) == "Hand Raised":
+                            state_by_cam[cam_key] = "IDLE"
 
                 # All landmark drawing functions modify rgb_frame in-place.
                 # We defer the single BGR conversion to here so we only pay the

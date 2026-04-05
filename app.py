@@ -27,20 +27,30 @@ from flask import (
     request,
 )
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func
 import cv2
 import os
 import landmarker
 from io import BytesIO
 import zipfile
 import camera_processor
+import queue as queue_module
+from threading import Lock as _Lock
 
 
 # Load environment variables
 load_dotenv()
 
+
 # Initialize Flask app
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY")
+
+if not app.config.get("SECRET_KEY"):
+    raise RuntimeError(
+        "SECRET_KEY is not set. Create a .env file with SECRET_KEY=<long-random-string>."
+    )
+
 
 # Configure database
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///site.db"
@@ -78,6 +88,26 @@ with app.app_context():
 # We pass the app, db, and Alert references after db.create_all() so the tables
 # exist before any camera thread could fire an alert.
 camera_processor.init(app, db, Alert)
+
+# SSE state — protected by _sse_lock
+_sse_clients: list = []
+_sse_lock = _Lock()
+
+
+def _push_sse_event(data: str) -> None:
+    """
+    Push an event string to all connected SSE clients.
+
+    :param data: The event data string to send to clients.
+    :type data: str
+    :return: None
+    """
+    with _sse_lock:
+        for q in list(_sse_clients):
+            try:
+                q.put_nowait(data)
+            except Exception:
+                pass
 
 
 def scan_local_cameras(max_index: int = 10) -> list:
@@ -124,7 +154,10 @@ def load_cameras() -> list:
 
     if os.path.exists(CAMERAS_JSON):
         with open(CAMERAS_JSON, "r") as f:
-            return json.load(f)
+            cams = json.load(f)
+        for cam in cams:
+            cam.setdefault("enabled", True)
+        return cams
 
     # First run: auto-detect and persist
     cams = []
@@ -141,6 +174,7 @@ def save_cameras(cams: list) -> None:
 
     :param cams: List of camera dicts to save.
     :type cams: list[dict]
+    :return: None
     """
 
     with open(CAMERAS_JSON, "w") as f:
@@ -171,25 +205,23 @@ def index() -> str:
     """
 
     cams = load_cameras()
-    output = ""
-    for cam in cams:
-        cam_id = cam["id"]
-        cam_name = cam["name"]
-        cam_source = cam["source"]
-        output += f"""
-            <h2>{cam_name}</h2>
-            <img src='/video_feed/{cam_id}' width='100%'>
-            <p>{Alert.query.filter_by(cam_no=str(cam_source)).count()} alerts</p>
-            <a href="/alerts/{cam_source}" class="btn btn-primary">View Alerts</a>&nbsp;
-            <form method="post" action="/clear_alerts/{cam_source}" style="display:inline;">
-                <button type="submit" class="btn btn-danger">Clear Alerts</button>
-            </form>&nbsp;
-            <form method="post" action="/remove_camera/{cam_id}" style="display:inline;">
-                <button type="submit" class="btn btn-warning">Remove Camera</button>
-            </form><hr>
-        """
-
-    return render_template("index.html", content=output, alerts=Alert.query.all())
+    alert_counts_raw = (
+        db.session.query(Alert.cam_no, func.count(Alert.id))
+        .group_by(Alert.cam_no)
+        .all()
+    )
+    alert_counts = {cam_no: count for cam_no, count in alert_counts_raw}
+    cam_data = [
+        {
+            "id": c["id"],
+            "name": c["name"],
+            "source": c["source"],
+            "alert_count": alert_counts.get(str(c["source"]), 0),
+            "enabled": c.get("enabled", True),
+        }
+        for c in cams
+    ]
+    return render_template("index.html", cams=cam_data, alerts=Alert.query.all())
 
 
 @app.route("/video_feed/<int:cam_id>")
@@ -254,7 +286,9 @@ def clear_alerts_by_cam(cam_no) -> str:
     try:
         # Delete alerts for the specified camera
         with app.app_context():
-            num_rows_deleted = Alert.query.filter_by(cam_no=str(cam_no)).delete()
+            num_rows_deleted = (
+                db.session.query(Alert).filter_by(cam_no=str(cam_no)).delete()
+            )
             db.session.commit()
 
     # Handle any exceptions that may occur during the deletion process and return an error message instead of crashing the application.
@@ -292,7 +326,7 @@ def alerts() -> str:
 
     # Update the evidence paths
     with camera_processor.state_lock:
-        evidence_paths = list(camera_processor.alert_evidence_paths)
+        evidence_paths = list(camera_processor.alert_evidence_paths.keys())
 
     # Send the page to the user with all alerts and the available evidence paths for download.
     return render_template(
@@ -332,7 +366,7 @@ def alerts_by_cam(cam_no: str) -> str:
 
     # Update the evidence paths
     with camera_processor.state_lock:
-        evidence_paths = list(camera_processor.alert_evidence_paths)
+        evidence_paths = list(camera_processor.alert_evidence_paths.keys())
 
     # Send the page to the user with the alerts for the specified camera and the available evidence paths for download.
     return render_template(
@@ -385,8 +419,9 @@ def download_file(filepath: str) -> Response:
     :rtype: Response
     """
 
+    safe_name = os.path.basename(filepath)
     return send_from_directory(
-        camera_processor.output_dir, filepath, as_attachment=True
+        camera_processor.output_dir, safe_name, as_attachment=True
     )
 
 
@@ -481,6 +516,57 @@ def refresh_cameras() -> Response:
             cams.append(
                 {"id": _next_cam_id(cams), "source": idx, "name": f"Camera {idx + 1}"}
             )
+    save_cameras(cams)
+    return redirect("/")
+
+
+@app.route("/alert_stream")
+def alert_stream() -> Response:
+    """
+    SSE endpoint — each connected dashboard tab gets live alert events.
+
+    :return: A streaming response that provides server-sent events for live alert updates.
+    :rtype: Response
+    """
+
+    def event_generator():
+        q = queue_module.Queue(maxsize=50)
+        with _sse_lock:
+            _sse_clients.append(q)
+        try:
+            while True:
+                try:
+                    data = q.get(timeout=30)
+                    yield f"data: {data}\n\n"
+                except queue_module.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            with _sse_lock:
+                _sse_clients.remove(q)
+
+    return Response(
+        event_generator(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.route("/toggle_camera/<int:cam_id>", methods=["POST"])
+def toggle_camera(cam_id: int) -> Response:
+    """
+    Toggles the enabled/disabled state of a camera in the registry.
+
+    :param cam_id: The registry ID of the camera to toggle.
+    :type cam_id: int
+    :return: Redirect to the main page.
+    :rtype: Response
+    """
+
+    cams = load_cameras()
+    for cam in cams:
+        if cam["id"] == cam_id:
+            cam["enabled"] = not cam.get("enabled", True)
+            break
     save_cameras(cams)
     return redirect("/")
 

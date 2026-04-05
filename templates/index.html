@@ -19,9 +19,26 @@
         <h1>Welcome to CheatGuard</h1>
     </header>
 
-    <!-- Display camera feed -->
+    <!-- Display camera feeds -->
     <main>
-        {{ content|safe }}
+        {% for cam in cams %}
+        <h2>{{ cam.name }}</h2>
+        <img src="/video_feed/{{ cam.id }}" width="100%" alt="Live feed for {{ cam.name }}">
+        <p>{{ cam.alert_count }} alerts</p>
+        <a href="/alerts/{{ cam.source }}" class="btn btn-primary">View Alerts</a>&nbsp;
+        <form method="post" action="/clear_alerts/{{ cam.source }}">
+            <button type="submit" class="btn btn-danger">Clear Alerts</button>
+        </form>&nbsp;
+        <form method="post" action="/remove_camera/{{ cam.id }}">
+            <button type="submit" class="btn btn-warning">Remove Camera</button>
+        </form>&nbsp;
+        <form method="post" action="/toggle_camera/{{ cam.id }}">
+            <button type="submit" class="btn btn-{{ 'success' if cam.enabled else 'secondary' }}">
+                {{ 'Disable' if cam.enabled else 'Enable' }} Camera
+            </button>
+        </form>
+        <hr>
+        {% endfor %}
     </main>
 
     <!-- Camera management -->
@@ -51,7 +68,13 @@
         <ul>
             {% for alert in alerts %}
             <li>
-                <strong>{% if alert.cam_no.isdigit() %}Camera {{ alert.cam_no|int + 1 }}{% else %}Camera path {{ alert.cam_no }}{% endif %}</strong>:
+                <strong>
+                    {% if alert.cam_no.isdigit() %}
+                    Camera {{ alert.cam_no|int + 1 }}
+                    {% else %}
+                    Camera path {{alert.cam_no}}
+                    {% endif %}
+                </strong>:
                 <u>{{ alert.alert_type }}</u> at {{ alert.timestamp }}
             </li>
             {% endfor %}
@@ -68,6 +91,26 @@
     <footer>
         <p>&copy; 2026 CheatGuard</p>
     </footer>
+
+    <div id="sse-toast" class="sse-toast position-fixed bottom-0 end-0 p-3">
+        <div class="toast show bg-danger text-white">
+            <div class="toast-header bg-danger text-white">
+                <strong class="me-auto">&#9888; CheatGuard Alert</strong>
+            </div>
+            <div class="toast-body" id="sse-toast-body"></div>
+        </div>
+    </div>
+    <script>
+        const evtSource = new EventSource("/alert_stream");
+        evtSource.onmessage = function (e) {
+            const data = JSON.parse(e.data);
+            const toast = document.getElementById("sse-toast");
+            document.getElementById("sse-toast-body").textContent =
+                `Camera ${data.cam}: ${data.type} at ${data.time}`;
+            toast.style.display = "block";
+            setTimeout(() => { toast.style.display = "none"; }, 6000);
+        };
+    </script>
 </body>
 
 </html>
